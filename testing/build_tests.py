@@ -75,15 +75,18 @@ def buildTestCase(testCaseDirectives, testCaseSourceDir, toolsDir, sdkDir, minOs
     compilerSearchOptions = " -isysroot " + sdkDir + " -I" + sdkDir + "/System/Library/Frameworks/System.framework/PrivateHeaders"
     if minOsOptionsName == "mmacosx-version-min":
         taskForPidCommand = "touch "
+        envEnableCommand  = "touch "
     else:
         taskForPidCommand = "codesign --force --sign - --entitlements " + testCaseSourceDir + "/../../task_for_pid_entitlement.plist "
+        envEnableCommand  = "codesign --force --sign - --entitlements " + testCaseSourceDir + "/../../get_task_allow_entitlement.plist "
     buildSubs = {
         "CC":                   toolsDir + "/usr/bin/clang "   + archOptions + " -" + minOsOptionsName + "=" + str(minOS) + compilerSearchOptions,
         "CXX":                  toolsDir + "/usr/bin/clang++ " + archOptions + " -" + minOsOptionsName + "=" + str(minOS) + compilerSearchOptions,
         "BUILD_DIR":            testCaseDestDirBuild,
         "RUN_DIR":              testCaseDestDirRun,
         "TEMP_DIR":             scratchDir,
-        "TASK_FOR_PID_ENABLE":  taskForPidCommand
+        "TASK_FOR_PID_ENABLE":  taskForPidCommand,
+        "DYLD_ENV_VARS_ENABLE": envEnableCommand
     }
     os.makedirs(testCaseDestDirBuild)
     os.chdir(testCaseSourceDir)
@@ -91,9 +94,12 @@ def buildTestCase(testCaseDirectives, testCaseSourceDir, toolsDir, sdkDir, minOs
     for line in testCaseDirectives["BUILD"]:
         cmd = string.Template(line).safe_substitute(buildSubs)
         print >> sys.stderr, cmd
-        cmdList = []
-        cmdList = string.split(cmd)
-        result = subprocess.call(cmdList)
+        if "&&" in cmd:
+            result = subprocess.call(cmd, shell=True)
+        else:
+            cmdList = []
+            cmdList = string.split(cmd)
+            result = subprocess.call(cmdList)
         if result:
             return result
     shutil.rmtree(scratchDir, ignore_errors=True)
@@ -127,15 +133,24 @@ if __name__ == "__main__":
     testsRunDstTopDir = "/AppleInternal/CoreOS/tests/dyld/"
     testsBuildDstTopDir = dstDir + testsRunDstTopDir
     shutil.rmtree(testsBuildDstTopDir, ignore_errors=True)
-    testsSrcTopDir = os.getenv("SRCROOT", "./") + "/testing/test-cases/"
-    sdkDir = os.getenv("SDKROOT", "/")
+    dyldSrcDir = os.getenv("SRCROOT", "")
+    if not dyldSrcDir:
+        dyldSrcDir = os.getcwd()
+    testsSrcTopDir = dyldSrcDir + "/testing/test-cases/"
+    sdkDir = os.getenv("SDKROOT", "")
+    if not sdkDir:
+        #sdkDir = subprocess.check_output(["xcrun", "--show-sdk-path"]).rstrip()
+        sdkDir = "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX10.13.Internal.sdk"
     toolsDir = os.getenv("TOOLCHAIN_DIR", "/")
     defaultMinOS = ""
+    minVersNum = "10.12"
     minOSOption = os.getenv("DEPLOYMENT_TARGET_CLANG_FLAG_NAME", "")
     if minOSOption:
         minOSVersName = os.getenv("DEPLOYMENT_TARGET_CLANG_ENV_NAME", "")
         if minOSVersName:
             minVersNum = os.getenv(minOSVersName, "")
+    else:
+        minOSOption = "mmacosx-version-min"
     platformName = os.getenv("PLATFORM_NAME", "osx")
     archOptions = ""
     archList = os.getenv("RC_ARCHS", "")
@@ -149,9 +164,11 @@ if __name__ == "__main__":
         elif platformName == "appletvos":
             archOptions = "-arch arm64"
         else:
-            archOptions = ""
-            for arch in string.split(archList, " "):
-                archOptions = archOptions + " -arch " + arch
+            if archList:
+                for arch in string.split(archList, " "):
+                    archOptions = archOptions + " -arch " + arch
+            else:
+                archOptions = "-arch x86_64"
     allTests = []
     for f in os.listdir(testsSrcTopDir):
         if f.endswith(".dtest"):
@@ -172,7 +189,7 @@ if __name__ == "__main__":
                 mytest["Command"].append("./run.sh")
                 for runline in testCaseDirectives["RUN"]:
                     if "$SUDO" in runline:
-                        mytest["AsRoot"] = 1
+                        mytest["AsRoot"] = True
                 if testCaseDirectives["RUN_TIMEOUT"]:
                     mytest["Timeout"] = testCaseDirectives["RUN_TIMEOUT"]
                 allTests.append(mytest)

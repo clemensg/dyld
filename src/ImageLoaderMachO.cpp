@@ -52,6 +52,7 @@
 #include "ImageLoaderMachOClassic.h"
 #endif
 #include "mach-o/dyld_images.h"
+#include "Tracing.h"
 #include "dyld.h"
 
 // <rdar://problem/8718137> use stack guard random value to add padding between dylibs
@@ -68,6 +69,43 @@ extern "C" long __stack_chk_guard;
 #ifndef LC_VERSION_MIN_WATCHOS
 	#define LC_VERSION_MIN_WATCHOS 0x30
 #endif
+
+#ifndef LC_BUILD_VERSION
+	#define LC_BUILD_VERSION 0x32 /* build for platform min OS version */
+
+	/*
+	 * The build_version_command contains the min OS version on which this 
+	 * binary was built to run for its platform.  The list of known platforms and
+	 * tool values following it.
+	 */
+	struct build_version_command {
+		uint32_t	cmd;		/* LC_BUILD_VERSION */
+		uint32_t	cmdsize;	/* sizeof(struct build_version_command) plus */
+								/* ntools * sizeof(struct build_tool_version) */
+		uint32_t	platform;	/* platform */
+		uint32_t	minos;		/* X.Y.Z is encoded in nibbles xxxx.yy.zz */
+		uint32_t	sdk;		/* X.Y.Z is encoded in nibbles xxxx.yy.zz */
+		uint32_t	ntools;		/* number of tool entries following this */
+	};
+
+	struct build_tool_version {
+		uint32_t	tool;		/* enum for the tool */
+		uint32_t	version;	/* version number of the tool */
+	};
+
+	/* Known values for the platform field above. */
+	#define PLATFORM_MACOS		1
+	#define PLATFORM_IOS		2
+	#define PLATFORM_TVOS		3
+	#define PLATFORM_WATCHOS	4
+	#define PLATFORM_BRIDGEOS	5
+
+	/* Known values for the tool field above. */
+	#define TOOL_CLANG	1
+	#define TOOL_SWIFT	2
+	#define TOOL_LD		3
+#endif
+
 
 
 #if TARGET_IPHONE_SIMULATOR
@@ -132,6 +170,12 @@ fSegmentsCount(segCount), fIsSplitSeg(false), fInSharedCache(false),
 
 }
 
+#if __MAC_OS_X_VERSION_MIN_REQUIRED
+static uintptr_t pageAlign(uintptr_t value)
+{
+	return (value + 4095) & (-4096);
+}
+#endif
 
 // determine if this mach-o file has classic or compressed LINKEDIT and number of segments it has
 void ImageLoaderMachO::sniffLoadCommands(const macho_header* mh, const char* path, bool inCache, bool* compressed,
@@ -185,12 +229,12 @@ void ImageLoaderMachO::sniffLoadCommands(const macho_header* mh, const char* pat
 				segCmd = (struct macho_segment_command*)cmd;
 #if __MAC_OS_X_VERSION_MIN_REQUIRED
 				// rdar://problem/19617624 allow unmapped segments on OSX (but not iOS)
-				if ( (segCmd->filesize > segCmd->vmsize) && (segCmd->vmsize != 0) )
+				if ( ((segCmd->filesize) > pageAlign(segCmd->vmsize)) && (segCmd->vmsize != 0) )
 #else
 				// <rdar://problem/19986776> dyld should support non-allocatable __LLVM segment
 				if ( (segCmd->filesize > segCmd->vmsize) && ((segCmd->vmsize != 0) || ((segCmd->flags & SG_NORELOC) == 0)) )
 #endif
-				    dyld::throwf("malformed mach-o image: segment load command %s filesize is larger than vmsize", segCmd->segname);
+				    dyld::throwf("malformed mach-o image: segment load command %s filesize (0x%0lX) is larger than vmsize (0x%0lX)", segCmd->segname, (long)segCmd->filesize , (long)segCmd->vmsize );
 				if ( cmd->cmdsize < sizeof(macho_segment_command) )
 					throw "malformed mach-o image: LC_SEGMENT size too small";
 				if ( cmd->cmdsize != (sizeof(macho_segment_command) + segCmd->nsects * sizeof(macho_section)) )
@@ -218,7 +262,7 @@ void ImageLoaderMachO::sniffLoadCommands(const macho_header* mh, const char* pat
 					if ( (segCmd->initprot != 0) && ((segCmd->initprot & VM_PROT_READ) == 0) )
 						dyld::throwf("malformed mach-o image: %s segment is not mapped readable", segCmd->segname);
 				}
-				if ( (segCmd->fileoff == 0) && (segCmd->filesize != 0) ) {
+                if ( (segCmd->fileoff == 0) && (segCmd->filesize != 0) ) {
 					if ( (segCmd->initprot & VM_PROT_READ) == 0 )
 						dyld::throwf("malformed mach-o image: %s segment maps start of file but is not readable", segCmd->segname);
 					if ( (segCmd->initprot & VM_PROT_WRITE) == VM_PROT_WRITE ) {
@@ -250,10 +294,12 @@ void ImageLoaderMachO::sniffLoadCommands(const macho_header* mh, const char* pat
 						}
 						else {
 							// allow: vmSize > fileSize && initprot != X  e.g. __DATA
-							if ( vmSize < fileSize )
+							if ( vmSize < fileSize ) {
 								dyld::throwf("malformed mach-o image: segment %s has vmsize < filesize", segCmd->segname);
-							if ( segCmd->initprot & VM_PROT_EXECUTE )
+							}
+							if ( segCmd->initprot & VM_PROT_EXECUTE ) {
 								dyld::throwf("malformed mach-o image: segment %s has vmsize != filesize and is executable", segCmd->segname);
+							}
 						}
 					}
 					if ( inCache ) {
@@ -348,7 +394,7 @@ void ImageLoaderMachO::sniffLoadCommands(const macho_header* mh, const char* pat
 		throw "load commands not in a segment";
 	if ( linkeditSegCmd == NULL )
 		throw "malformed mach-o image: missing __LINKEDIT segment";
-	if ( startOfFileSegCmd == NULL )
+	if ( !inCache && (startOfFileSegCmd == NULL) )
 		throw "malformed mach-o image: missing __TEXT segment that maps start of file";
 	// <rdar://problem/13145644> verify every segment does not overlap another segment
 	if ( context.strictMachORequired ) {
@@ -1250,6 +1296,7 @@ uint32_t ImageLoaderMachO::sdkVersion(const mach_header* mh)
 	const struct load_command* const cmds = (struct load_command*)(((char*)mh) + sizeof(macho_header));
 	const struct load_command* cmd = cmds;
 	const struct version_min_command* versCmd;
+	const struct build_version_command* buildVersCmd;
 	for (uint32_t i = 0; i < cmd_count; ++i) {
 		switch ( cmd->cmd ) {
 			case LC_VERSION_MIN_MACOSX:
@@ -1258,6 +1305,9 @@ uint32_t ImageLoaderMachO::sdkVersion(const mach_header* mh)
 			case LC_VERSION_MIN_WATCHOS:
 				versCmd = (version_min_command*)cmd;
 				return versCmd->sdk;
+			case LC_BUILD_VERSION:
+				buildVersCmd = (build_version_command*)cmd;
+				return buildVersCmd->sdk;
 		}
 		cmd = (const struct load_command*)(((char*)cmd)+cmd->cmdsize);
 	}
@@ -1275,6 +1325,7 @@ uint32_t ImageLoaderMachO::minOSVersion(const mach_header* mh)
 	const struct load_command* const cmds = (struct load_command*)(((char*)mh) + sizeof(macho_header));
 	const struct load_command* cmd = cmds;
 	const struct version_min_command* versCmd;
+	const struct build_version_command* buildVersCmd;
 	for (uint32_t i = 0; i < cmd_count; ++i) {
 		switch ( cmd->cmd ) {
 			case LC_VERSION_MIN_MACOSX:
@@ -1283,6 +1334,9 @@ uint32_t ImageLoaderMachO::minOSVersion(const mach_header* mh)
 			case LC_VERSION_MIN_WATCHOS:
 				versCmd = (version_min_command*)cmd;
 				return versCmd->version;
+			case LC_BUILD_VERSION:
+				buildVersCmd = (build_version_command*)cmd;
+				return buildVersCmd->minos;
 		}
 		cmd = (const struct load_command*)(((char*)cmd)+cmd->cmdsize);
 	}
@@ -1786,7 +1840,7 @@ intptr_t ImageLoaderMachO::computeSlide(const mach_header* mh)
 	for (uint32_t i = 0; i < cmd_count; ++i) {
 		if ( cmd->cmd == LC_SEGMENT_COMMAND ) {
 			const macho_segment_command* seg = (macho_segment_command*)cmd;
-			if ( (seg->fileoff == 0) && (seg->filesize != 0) )
+			if ( strcmp(seg->segname, "__TEXT") == 0 )
 				return (char*)mh - (char*)(seg->vmaddr);
 		}
 		cmd = (const load_command*)(((char*)cmd)+cmd->cmdsize);
@@ -1996,7 +2050,7 @@ struct DATAdyld {
 
 // These are defined in dyldStartup.s
 extern "C" void stub_binding_helper();
-
+extern "C" int _dyld_func_lookup(const char* name, void** address);
 
 void ImageLoaderMachO::setupLazyPointerHandler(const LinkContext& context)
 {
@@ -2152,7 +2206,9 @@ void ImageLoaderMachO::doImageInit(const LinkContext& context)
 					}
 					if ( context.verboseInit )
 						dyld::log("dyld: calling -init function %p in %s\n", func, this->getPath());
-					func(context.argc, context.argv, context.envp, context.apple, &context.programVars);
+                    dyld3::kdebug_trace_dyld_duration(DBG_DYLD_TIMING_STATIC_INITIALIZER, (uint64_t)func, 0, ^{
+                        func(context.argc, context.argv, context.envp, context.apple, &context.programVars);
+                    });
 					break;
 			}
 			cmd = (const struct load_command*)(((char*)cmd)+cmd->cmdsize);
@@ -2194,7 +2250,9 @@ void ImageLoaderMachO::doModInitFunctions(const LinkContext& context)
 							if ( context.verboseInit )
 								dyld::log("dyld: calling initializer function %p in %s\n", func, this->getPath());
 							bool haveLibSystemHelpersBefore = (dyld::gLibSystemHelpers != NULL);
-							func(context.argc, context.argv, context.envp, context.apple, &context.programVars);
+                            dyld3::kdebug_trace_dyld_duration(DBG_DYLD_TIMING_STATIC_INITIALIZER, (uint64_t)func, 0, ^{
+                                func(context.argc, context.argv, context.envp, context.apple, &context.programVars);
+                            });
 							bool haveLibSystemHelpersAfter = (dyld::gLibSystemHelpers != NULL);
 							if ( !haveLibSystemHelpersBefore && haveLibSystemHelpersAfter ) {
 								// now safe to use malloc() and other calls in libSystem.dylib
@@ -2414,7 +2472,7 @@ void ImageLoaderMachO::mapSegments(int fd, uint64_t offsetInFat, uint64_t lenInF
 	}
 	// map in all segments
 	for(unsigned int i=0, e=segmentCount(); i < e; ++i) {
-		vm_offset_t fileOffset = segFileOffset(i) + offsetInFat;
+		vm_offset_t fileOffset = (vm_offset_t)(segFileOffset(i) + offsetInFat);
 		vm_size_t size = segFileSize(i);
 		uintptr_t requestedLoadAddress = segPreferredLoadAddress(i) + slide;
 		int protection = 0;
@@ -2561,8 +2619,9 @@ const char* ImageLoaderMachO::findClosestSymbol(const mach_header* mh, const voi
 					unslidLinkEditBase = (uint8_t*)(seg->vmaddr - seg->fileoff);
 					linkEditBaseFound = true;
 				}
-				else if ( (seg->fileoff == 0) && (seg->filesize != 0) )
+				else if ( strcmp(seg->segname, "__TEXT") == 0 ) {
 					slide = (uintptr_t)mh - seg->vmaddr;
+                }
 				break;
 			case LC_SYMTAB:
 				symtab = (symtab_command*)cmd;
